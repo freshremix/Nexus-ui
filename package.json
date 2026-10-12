@@ -1,0 +1,17 @@
+{
+  "name": "nexus-cpanel-panel",
+  "version": "1.0.0",
+  "description": "NEXUS premium VLESS user management panel prototype for cPanel Node.js App Deploy",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
