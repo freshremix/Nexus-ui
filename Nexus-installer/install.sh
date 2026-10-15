@@ -1,270 +1,183 @@
 
-cat > install.sh <<'INSTALLER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
 
-# Nexus Pro installer for Fly.io Sprites.
-# Existing Nexus processes and existing Cloudflare tunnel configs are preserved.
+BASE="$HOME/.nexus-pro-deploy"
+LOGDIR="$BASE/logs"
+CF_CONFIG_DIR="$BASE/cloudflared"
+STATE="$BASE/state.env"
+CF="${CF:-/root/Argo/cloudflared}"
+NODE="${NODE:-/.sprite/languages/node/nvm/versions/node/v24.18.0/bin/node}"
+PROJECT_DEFAULT="$HOME/Nexus-ui"
+PORT_DEFAULT="9127"
 
-APP_DEFAULT="$HOME/Nexus-ui"
-NODE_DEFAULT="/.sprite/languages/node/nvm/versions/node/v24.18.0/bin"
-CF_DEFAULT="/root/Argo/cloudflared"
-STATE="$HOME/.nexus-pro-deploy"
-LOGDIR="$STATE/logs"
-mkdir -p "$LOGDIR"
-chmod 700 "$STATE" "$LOGDIR"
+mkdir -p "$LOGDIR" "$CF_CONFIG_DIR"
 
-APP=""
-PORT=""
-HOSTNAME=""
-TUNNEL=""
-NODE=""
-NPM=""
-CF=""
-APP_PID=""
-CF_PID=""
-CONFIG=""
-
-info() { printf '\n[INFO] %s\n' "$*"; }
-ok()   { printf '\n[ OK ] %s\n' "$*"; }
+say() { printf '\n[INFO] %s\n' "$*"; }
 warn() { printf '\n[WARN] %s\n' "$*" >&2; }
-die()  { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
-
+die() { printf '\n[ERROR] %s\n' "$*" >&2; exit 1; }
 ask() {
-  local answer
-  read -r -p "$1 [$2]: " answer
-  printf '%s' "${answer:-$2}"
-}
-
-on_error() {
-  local rc=$?
-  printf '\n[ERROR] Script failed (exit code %s).\n' "$rc" >&2
-  printf 'Check logs under: %s\n' "$LOGDIR" >&2
-  if [[ -n "${APP:-}" && -f "$APP/logs/nexus.log" ]]; then
-    tail -n 25 "$APP/logs/nexus.log" >&2 || true
-  fi
-  exit "$rc"
-}
-trap on_error ERR
-
-valid_host() {
-  [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]
-}
-
-health_check() {
-  local url="$1"
-  curl -fsS --connect-timeout 2 --max-time 5 "$url" >/dev/null 2>&1
-}
-
-echo "================================================"
-echo "       Nexus Pro - Sprite Deployment Wizard"
-echo "================================================"
-echo "This wizard uses English prompts."
-echo "Existing webtmux and old Cloudflare tunnel configs"
-echo "will not intentionally be stopped or overwritten."
-echo
-
-# Use a timeout so a broken Node launcher cannot hang the wizard forever.
-command -v timeout >/dev/null 2>&1 ||
-  die "The 'timeout' command is required."
-
-info "Locating the Sprite Node.js installation."
-
-if [[ -x "$NODE_DEFAULT/node" ]]; then
-  NODE="$NODE_DEFAULT/node"
-elif command -v node >/dev/null 2>&1; then
-  NODE="$(command -v node)"
-else
-  die "Node.js was not found."
-fi
-
-NODE_VERSION="$(timeout 8s "$NODE" --version 2>&1)" ||
-  die "Node.js did not return its version within 8 seconds. Check the executable: $NODE"
-[[ "$NODE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]] ||
-  die "Unexpected Node.js version output: $NODE_VERSION"
-
-NODE_DIR="$(dirname "$NODE")"
-export PATH="$NODE_DIR:$PATH"
-
-info "Node.js: $NODE_VERSION"
-info "Node executable: $NODE"
-
-if [[ -x "$NODE_DIR/npm" ]]; then
-  NPM="$NODE_DIR/npm"
-elif command -v npm >/dev/null 2>&1; then
-  NPM="$(command -v npm)"
-else
-  die "npm was not found."
-fi
-
-NPM_VERSION="$(timeout 8s "$NPM" --version 2>&1)" ||
-  die "npm did not respond within 8 seconds."
-info "npm: $NPM_VERSION"
-
-APP="$(ask 'Nexus Pro project directory' "$APP_DEFAULT")"
-APP="${APP/#\~/$HOME}"
-[[ -d "$APP" ]] || die "Project directory does not exist: $APP"
-
-PORT="$(ask 'Nexus local port' '9127')"
-[[ "$PORT" =~ ^[0-9]+$ ]] &&
-  (( PORT >= 1024 && PORT <= 65535 )) ||
-  die "Invalid port number."
-
-HEALTH_PATH="$(ask 'Nexus health endpoint' '/api/health')"
-[[ "$HEALTH_PATH" == /* ]] || HEALTH_PATH="/$HEALTH_PATH"
-LOCAL_URL="http://127.0.0.1:$PORT$HEALTH_PATH"
-
-mkdir -p "$APP/logs"
-
-# Reuse the current healthy panel instead of starting a duplicate.
-if health_check "$LOCAL_URL"; then
-  ok "An existing Nexus instance is already healthy."
-  info "Keeping the current process untouched."
-  curl -fsS --max-time 5 "$LOCAL_URL" || true
-  printf '\n'
-else
-  warn "No healthy Nexus instance detected at $LOCAL_URL."
-
-  [[ -f "$APP/index.js" ]] ||
-    die "index.js not found in $APP"
-  [[ -f "$APP/package.json" ]] ||
-    die "package.json not found. The installer will not invent project dependencies."
-
-  cd "$APP"
-
-  if [[ ! -d node_modules ]]; then
-    info "Installing project dependencies."
-    if [[ -f package-lock.json ]]; then
-      timeout 600s "$NPM" ci --no-audit --no-fund \
-        > "$LOGDIR/npm-install.log" 2>&1 ||
-        { tail -n 60 "$LOGDIR/npm-install.log"; die "npm ci failed."; }
-    else
-      timeout 600s "$NPM" install --no-audit --no-fund \
-        > "$LOGDIR/npm-install.log" 2>&1 ||
-        { tail -n 60 "$LOGDIR/npm-install.log"; die "npm install failed."; }
-    fi
+  local prompt="$1" default="${2:-}" answer
+  if [[ -n "$default" ]]; then
+    read -r -p "$prompt [$default]: " answer
+    printf '%s' "${answer:-$default}"
   else
-    info "node_modules exists; checking the installed Express module."
-    if ! timeout 8s "$NODE" -e "require('express')" >/dev/null 2>&1; then
-      warn "Express is not available. Installing package dependencies."
-      if [[ -f package-lock.json ]]; then
-        timeout 600s "$NPM" ci --no-audit --no-fund \
-          > "$LOGDIR/npm-install.log" 2>&1 ||
-          { tail -n 60 "$LOGDIR/npm-install.log"; die "Dependency installation failed."; }
-      else
-        timeout 600s "$NPM" install --no-audit --no-fund \
-          > "$LOGDIR/npm-install.log" 2>&1 ||
-          { tail -n 60 "$LOGDIR/npm-install.log"; die "Dependency installation failed."; }
+    read -r -p "$prompt: " answer
+    printf '%s' "$answer"
+  fi
+}
+confirm() {
+  local answer
+  read -r -p "$1 Type YES to continue: " answer
+  [[ "$answer" == "YES" ]]
+}
+valid_domain() {
+  [[ "$1" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]
+}
+valid_label() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+load_state() {
+  [[ -f "$STATE" ]] || return 1
+  # State is written by this script; don't source arbitrary files.
+  PROJECT="$(sed -n 's/^PROJECT=//p' "$STATE" | head -n1)"
+  PORT="$(sed -n 's/^PORT=//p' "$STATE" | head -n1)"
+  HOSTNAME="$(sed -n 's/^HOSTNAME=//p' "$STATE" | head -n1)"
+  TUNNEL="$(sed -n 's/^TUNNEL=//p' "$STATE" | head -n1)"
+  TUNNEL_ID="$(sed -n 's/^TUNNEL_ID=//p' "$STATE" | head -n1)"
+  CONFIG="$(sed -n 's/^CONFIG=//p' "$STATE" | head -n1)"
+}
+
+save_state() {
+  local tmp="$STATE.tmp"
+  {
+    printf 'PROJECT=%s\n' "$PROJECT"
+    printf 'PORT=%s\n' "$PORT"
+    printf 'HOSTNAME=%s\n' "$HOSTNAME"
+    printf 'TUNNEL=%s\n' "$TUNNEL"
+    printf 'TUNNEL_ID=%s\n' "$TUNNEL_ID"
+    printf 'CONFIG=%s\n' "$CONFIG"
+  } > "$tmp"
+  mv "$tmp" "$STATE"
+  chmod 600 "$STATE"
+}
+
+cleanup_install() {
+  say "Cleanup mode: inspect this script's saved deployment state."
+  if ! load_state; then
+    warn "No saved state found. Automatic deletion is disabled to avoid deleting unrelated resources."
+    printf 'No resources were removed.\n'
+    return 0
+  fi
+
+  printf '\nSaved deployment:\n'
+  printf 'Project: %s\nPort: %s\nHostname: %s\nTunnel: %s\nTunnel ID: %s\nConfig: %s\n' \
+    "$PROJECT" "$PORT" "$HOSTNAME" "$TUNNEL" "$TUNNEL_ID" "$CONFIG"
+
+  warn "Cleanup can stop only processes and remove files positively identified as belonging to this deployment."
+  warn "DNS deletion must be confirmed against the exact Cloudflare zone; this script will not guess the zone."
+  confirm "Remove this deployment's local config/state and attempt to stop its dedicated tunnel?" || {
+    say "Cancelled. Nothing changed."
+    return 0
+  }
+
+  # Stop only cloudflared processes explicitly using this dedicated config.
+  if command -v pgrep >/dev/null 2>&1; then
+    while read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      cmd="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+      if [[ "$cmd" == *"$CONFIG"* && "$cmd" == *"cloudflared"* ]]; then
+        kill "$pid" 2>/dev/null || true
       fi
-    fi
+    done < <(pgrep -f 'cloudflared.*nexus-pro-deploy' || true)
   fi
 
-  # Refuse to occupy a port already owned by another service.
-  if command -v ss >/dev/null 2>&1 &&
-     ss -lnt | awk '{print $4}' | grep -Eq "(:|\])${PORT}$"; then
-    die "Port $PORT is occupied, but the Nexus health check failed. No process was stopped."
+  printf '\nDNS cleanup is a separate explicit action.\n'
+  printf 'Do not delete records from an assumed zone. Current hostname: %s\n' "$HOSTNAME"
+  printf 'After verifying the exact zone in Cloudflare, remove its matching CNAME manually if it belongs to this deployment.\n'
+
+  # Remove only this installer's own dedicated config and state.
+  [[ -n "${CONFIG:-}" && "$CONFIG" == "$CF_CONFIG_DIR/"*.yml ]] && rm -f -- "$CONFIG"
+  rm -f -- "$STATE"
+  say "Local deployment state/config cleanup finished."
+  say "Project files, Nexus process, DNS records, Cloudflare credentials, argo02 and webtmux were NOT deleted."
+}
+
+install_mode() {
+  say "Nexus Pro deployment — interactive setup"
+  say "Every value is requested for this run; no previous domain is assumed."
+
+  PROJECT="$(ask 'Absolute path to Nexus project directory' "$PROJECT_DEFAULT")"
+  [[ "$PROJECT" = /* && -d "$PROJECT" ]] || die "Project directory does not exist or is not an absolute path."
+  [[ -f "$PROJECT/index.js" ]] || die "Cannot find $PROJECT/index.js"
+  [[ -f "$PROJECT/package.json" ]] || die "Cannot find $PROJECT/package.json"
+
+  PORT="$(ask 'Local panel port' "$PORT_DEFAULT")"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT > 0 && PORT < 65536 )) || die "Invalid port."
+
+  ROOT_DOMAIN="$(ask 'Root domain managed in Cloudflare (example.com)')"
+  valid_domain "$ROOT_DOMAIN" || die "Invalid root domain."
+  ROOT_DOMAIN="${ROOT_DOMAIN,,}"
+
+  SUBDOMAIN="$(ask 'Subdomain label (example: nexus; enter @ for root domain)')"
+  if [[ "$SUBDOMAIN" != "@" ]]; then
+    valid_label "$SUBDOMAIN" || die "Invalid subdomain label."
+    SUBDOMAIN="${SUBDOMAIN,,}"
+    HOSTNAME="$SUBDOMAIN.$ROOT_DOMAIN"
+  else
+    HOSTNAME="$ROOT_DOMAIN"
   fi
 
-  # Do not source .env automatically: it may contain secrets or override
-  # runtime settings. The app must honor PORT or its documented config.
-  APP_LOG="$APP/logs/nexus.log"
-  info "Starting Nexus Pro in the background."
-  nohup env PORT="$PORT" SERVER_PORT="$PORT" \
-    "$NODE" "$APP/index.js" >> "$APP_LOG" 2>&1 </dev/null &
-  APP_PID=$!
-  printf '%s\n' "$APP_PID" > "$APP/nexus.pid"
+  TUNNEL="$(ask 'New unique tunnel name' "nexus-$(date +%s)")"
+  valid_label "$TUNNEL" || die "Invalid tunnel name."
+  [[ "$TUNNEL" != "argo02" ]] || die "Refusing to use the protected old tunnel name argo02."
 
-  healthy=0
-  for _ in {1..15}; do
-    if health_check "$LOCAL_URL"; then
-      healthy=1
-      break
-    fi
-    if ! kill -0 "$APP_PID" 2>/dev/null; then
-      break
-    fi
-    sleep 2
-  done
+  [[ -x "$CF" ]] || die "cloudflared executable not found at $CF"
+  [[ -x "$NODE" ]] || {
+    command -v node >/dev/null 2>&1 && NODE="$(command -v node)" || die "Node executable not found."
+  }
 
-  if (( healthy == 0 )); then
-    tail -n 70 "$APP_LOG" || true
-    die "Nexus did not pass its local health check. Fix the app before configuring the domain."
+  say "Checking local panel before starting anything..."
+  if curl -fsS --max-time 5 "http://127.0.0.1:$PORT/" -o /dev/null; then
+    say "A panel already responds on port $PORT; it will not be restarted."
+  else
+    if command -v ss >/dev/null 2>&1 && ss -lnt 2>/dev/null | grep -Eq "[:.]$PORT[[:space:]]"; then
+      die "Port $PORT is occupied but the panel root did not pass. Inspect the process before continuing."
+    fi
+    if [[ -f "$PROJECT/package-lock.json" ]]; then
+      (cd "$PROJECT" && npm ci) || die "npm ci failed."
+    else
+      (cd "$PROJECT" && npm install) || die "npm install failed."
+    fi
+    say "Starting Nexus in the background..."
+    mkdir -p "$PROJECT/logs"
+    nohup env PORT="$PORT" SERVER_PORT="$PORT" "$NODE" "$PROJECT/index.js" \
+      >> "$PROJECT/logs/nexus.log" 2>&1 < /dev/null &
+    sleep 3
+    curl -fsS --max-time 8 "http://127.0.0.1:$PORT/" -o /dev/null ||
+      die "Nexus did not pass the local HTTP check. See $PROJECT/logs/nexus.log"
   fi
-  ok "Nexus local health check passed."
-fi
 
-echo
-info "Finding cloudflared."
+  say "Creating a dedicated Cloudflare tunnel."
+  say "This step requires an existing Cloudflare login certificate in ~/.cloudflared/cert.pem."
+  [[ -s "$HOME/.cloudflared/cert.pem" ]] || die "Missing $HOME/.cloudflared/cert.pem. Complete cloudflared tunnel login first."
 
-if [[ -x "$CF_DEFAULT" ]]; then
-  CF="$CF_DEFAULT"
-elif command -v cloudflared >/dev/null 2>&1; then
-  CF="$(command -v cloudflared)"
-else
-  die "cloudflared not found. Expected $CF_DEFAULT or a cloudflared command in PATH."
-fi
+  # Validate zone selection before creating the tunnel.
+  printf '\nCloudflare zone check for: %s\n' "$ROOT_DOMAIN"
+  printf 'The route command must create exactly %s, not append another domain.\n' "$HOSTNAME"
+  confirm "Have you verified that $ROOT_DOMAIN is an active zone in this Cloudflare account?" ||
+    die "Stopped before creating DNS/tunnel resources. Verify the correct Cloudflare account/zone."
 
-timeout 10s "$CF" --version ||
-  die "cloudflared did not return its version."
+  TUNNEL_ID="$("$CF" tunnel create "$TUNNEL" 2>&1 | tee "$LOGDIR/tunnel-create-$TUNNEL.log" | sed -nE 's/.*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}).*/\1/p' | tail -n1)"
+  [[ "$TUNNEL_ID" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Could not determine new tunnel ID. Inspect $LOGDIR/tunnel-create-$TUNNEL.log"
 
-echo
-echo "Cloudflare domain setup"
-echo "Use a hostname belonging to a zone already added to your Cloudflare account."
-echo
+  CREDENTIALS="$HOME/.cloudflared/$TUNNEL_ID.json"
+  [[ -s "$CREDENTIALS" ]] || die "Tunnel credentials file not found: $CREDENTIALS"
 
-HOSTNAME="$(ask 'Full panel hostname (example: nexus.example.com)' '')"
-valid_host "$HOSTNAME" || die "Invalid hostname: $HOSTNAME"
-HOSTNAME="$(printf '%s' "$HOSTNAME" | tr '[:upper:]' '[:lower:]')"
-
-TUNNEL="$(ask 'NEW dedicated tunnel name' 'nexus-pro-panel')"
-[[ "$TUNNEL" =~ ^[a-zA-Z0-9_-]+$ ]] ||
-  die "Tunnel name may contain only letters, digits, underscores and hyphens."
-
-CF_HOME="$HOME/.cloudflared"
-mkdir -p "$CF_HOME" "$STATE/cloudflared"
-chmod 700 "$CF_HOME" "$STATE/cloudflared"
-
-# Existing global tunnel config is deliberately never edited.
-if [[ ! -f "$CF_HOME/cert.pem" ]]; then
-  echo
-  echo "Cloudflare login is required."
-  echo "Open the URL printed below and authorize the correct domain."
-  "$CF" tunnel login
-fi
-[[ -f "$CF_HOME/cert.pem" ]] ||
-  die "Cloudflare login certificate not found at $CF_HOME/cert.pem"
-
-# Refuse to reuse an existing tunnel name.
-TUNNEL_LIST="$LOGDIR/tunnel-list.txt"
-"$CF" tunnel list > "$TUNNEL_LIST" 2>&1 ||
-  die "Unable to list Cloudflare tunnels. Check Cloudflare login."
-
-if awk -v n="$TUNNEL" 'NR>1 && $2==n {found=1} END {exit !found}' "$TUNNEL_LIST"; then
-  die "Tunnel '$TUNNEL' already exists. Choose a NEW name; no existing tunnel was modified."
-fi
-
-info "Creating a dedicated Cloudflare tunnel: $TUNNEL"
-"$CF" tunnel create "$TUNNEL" > "$LOGDIR/tunnel-create.log" 2>&1 ||
-  { cat "$LOGDIR/tunnel-create.log"; die "Tunnel creation failed."; }
-
-"$CF" tunnel list > "$TUNNEL_LIST" 2>&1 ||
-  die "Unable to refresh tunnel list."
-
-TUNNEL_ID="$(awk -v n="$TUNNEL" 'NR>1 && $2==n {print $1; exit}' "$TUNNEL_LIST")"
-[[ "$TUNNEL_ID" =~ ^[0-9a-fA-F-]{36}$ ]] ||
-  die "Could not determine the new tunnel ID. Check $TUNNEL_LIST"
-
-CREDENTIALS="$CF_HOME/$TUNNEL_ID.json"
-[[ -f "$CREDENTIALS" ]] ||
-  die "Tunnel credentials not found: $CREDENTIALS"
-chmod 600 "$CREDENTIALS"
-
-CONFIG="$STATE/cloudflared/$TUNNEL.yml"
-[[ ! -e "$CONFIG" ]] ||
-  die "A deployment config already exists at $CONFIG. It was not overwritten."
-
-cat > "$CONFIG" <<EOF
+  CONFIG="$CF_CONFIG_DIR/$TUNNEL.yml"
+  cat > "$CONFIG" <<EOF
 tunnel: $TUNNEL_ID
 credentials-file: $CREDENTIALS
 no-autoupdate: true
@@ -274,76 +187,55 @@ ingress:
     service: http://127.0.0.1:$PORT
   - service: http_status:404
 EOF
-chmod 600 "$CONFIG"
+  chmod 600 "$CONFIG"
 
-info "Creating DNS route for $HOSTNAME"
-"$CF" tunnel route dns "$TUNNEL_ID" "$HOSTNAME" ||
-  die "DNS route creation failed. Check whether this hostname already has a DNS record or whether the zone is authorized."
+  say "Validating tunnel configuration..."
+  "$CF" tunnel --config "$CONFIG" ingress validate || die "Tunnel ingress validation failed."
 
-CF_LOG="$LOGDIR/cloudflared-$TUNNEL.log"
-CF_PID_FILE="$STATE/cloudflared-$TUNNEL.pid"
-
-# Do not launch a duplicate tunnel if this deployment's PID is still alive.
-if [[ -f "$CF_PID_FILE" ]]; then
-  old_cf_pid="$(cat "$CF_PID_FILE" 2>/dev/null || true)"
-  if [[ "$old_cf_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_cf_pid" 2>/dev/null; then
-    die "This installer's tunnel process is already running (PID $old_cf_pid)."
+  say "Creating DNS route for exact hostname: $HOSTNAME"
+  if ! "$CF" tunnel route dns "$TUNNEL_ID" "$HOSTNAME" 2>&1 | tee "$LOGDIR/dns-$TUNNEL.log"; then
+    warn "DNS route failed. Tunnel/config are preserved for inspection."
+    save_state
+    die "DNS setup failed. Check Cloudflare zone/account; do not rerun blindly."
   fi
-fi
 
-info "Starting the new dedicated tunnel."
-nohup "$CF" tunnel --no-autoupdate --config "$CONFIG" run "$TUNNEL_ID" \
-  >> "$CF_LOG" 2>&1 </dev/null &
-CF_PID=$!
-printf '%s\n' "$CF_PID" > "$CF_PID_FILE"
+  save_state
+  say "Starting the dedicated tunnel..."
+  nohup "$CF" tunnel --no-autoupdate --config "$CONFIG" run "$TUNNEL_ID" \
+    >> "$LOGDIR/cloudflared-$TUNNEL.log" 2>&1 < /dev/null &
+  sleep 4
 
-sleep 4
-kill -0 "$CF_PID" 2>/dev/null ||
-  { tail -n 60 "$CF_LOG" || true; die "Cloudflare tunnel process exited."; }
+  say "Checking DNS and HTTPS (up to 60 seconds)..."
+  ok=0
+  for _ in $(seq 1 12); do
+    if curl -fsS --max-time 8 "https://$HOSTNAME/" -o /dev/null; then
+      ok=1
+      break
+    fi
+    sleep 5
+  done
 
-echo
-info "Waiting for public HTTPS. DNS propagation can take time."
-PUBLIC_OK=0
-for _ in {1..12}; do
-  if health_check "https://$HOSTNAME$HEALTH_PATH"; then
-    PUBLIC_OK=1
-    break
+  printf '\n========== DEPLOYMENT REPORT ==========\n'
+  printf 'Panel URL: https://%s/\nLocal endpoint: http://127.0.0.1:%s/\nTunnel: %s\nTunnel ID: %s\n' \
+    "$HOSTNAME" "$PORT" "$TUNNEL" "$TUNNEL_ID"
+  printf 'Nexus log: %s/logs/nexus.log\nTunnel log: %s/cloudflared-%s.log\nConfig: %s\n' \
+    "$PROJECT" "$LOGDIR" "$TUNNEL" "$CONFIG"
+  if (( ok )); then
+    say "Public HTTPS verification passed."
+  else
+    warn "HTTPS is not verified yet. Deployment state is saved; do not reinstall."
+    warn "Check DNS zone, then inspect: $LOGDIR/cloudflared-$TUNNEL.log"
   fi
-  sleep 5
-done
+}
 
-echo
-echo "================================================"
-echo "                 Deployment Report"
-echo "================================================"
-echo "Panel URL:       https://$HOSTNAME"
-echo "Local endpoint:  $LOCAL_URL"
-echo "Tunnel name:     $TUNNEL"
-echo "Tunnel ID:       $TUNNEL_ID"
-echo "Nexus log:       $APP/logs/nexus.log"
-echo "Tunnel log:      $CF_LOG"
-echo "Tunnel config:   $CONFIG"
-echo "Deployment logs: $LOGDIR"
-
-if (( PUBLIC_OK == 1 )); then
-  ok "Public HTTPS health check passed."
-  curl -fsS --max-time 8 "https://$HOSTNAME$HEALTH_PATH" || true
-  printf '\n'
-else
-  warn "Public HTTPS check did not pass yet. Installation is NOT fully verified."
-  echo "Inspect tunnel log:"
-  echo "  tail -n 80 '$CF_LOG'"
-  echo "Test public endpoint:"
-  echo "  curl -v --max-time 15 'https://$HOSTNAME$HEALTH_PATH'"
-fi
-
-echo
-echo "Existing webtmux and the old Cloudflare config were not intentionally changed."
-echo "Background processes may not survive a Sprite recycle."
-INSTALLER
-
-chmod 700 install.sh
-bash -n install.sh && echo "Syntax check passed."
-INSTALLER
-
-bash install.sh
+printf '\nNEXUS PRO — SPRITE DEPLOYMENT MANAGER\n'
+printf '1) Install / reinstall\n'
+printf '2) Cleanup this script-managed deployment\n'
+printf '3) Exit\n'
+choice="$(ask 'Choose an option (1-3)')"
+case "$choice" in
+  1) install_mode ;;
+  2) cleanup_install ;;
+  3) exit 0 ;;
+  *) die "Invalid option." ;;
+esac
