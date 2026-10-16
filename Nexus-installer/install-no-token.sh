@@ -2,16 +2,15 @@
 cat > /root/nexus-manager.sh <<'SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 CF="/root/Argo/cloudflared"
 APP_DIR="/root/Nexus-ui"
 BASE="/root/.nexus-pro-deploy"
+CF_DIR="/root/.cloudflared"
 PORT="9127"
 DOMAIN="spot4u.ir"
 HOSTNAME="nxpr.spot4u.ir"
-TUNNEL_NAME="nexus-pro-$(date +%Y%m%d%H%M%S)"
-CONFIG_DIR="$BASE/cloudflared"
-LOG_DIR="$BASE/logs"
 
 pause() {
   echo
@@ -20,19 +19,33 @@ pause() {
 
 check_cf() {
   if [[ ! -x "$CF" ]]; then
-    echo "ERROR: cloudflared was not found at $CF"
+    echo "ERROR: cloudflared binary not found: $CF"
     return 1
   fi
 }
 
+get_state_value() {
+  local key="$1"
+  local file="$2"
+  [[ -f "$file" ]] || return 1
+  sed -n "s/^${key}='\\(.*\\)'$/\\1/p" "$file" | head -n 1
+}
+
+tunnel_exists() {
+  local id="$1"
+  "$CF" tunnel list 2>/dev/null |
+    awk 'NR>1 {print $1}' |
+    grep -Fxq "$id"
+}
+
 install_nexus() {
   echo
-  echo "========== OPTION 1: INSTALL =========="
+  echo "========== INSTALL NEXUS TUNNEL =========="
 
   check_cf || { pause; return; }
 
   if [[ ! -d "$APP_DIR" ]]; then
-    echo "ERROR: Nexus application directory not found: $APP_DIR"
+    echo "ERROR: Nexus directory not found: $APP_DIR"
     pause
     return
   fi
@@ -40,67 +53,83 @@ install_nexus() {
   echo "Checking local Nexus application..."
   if ! curl -fsS --max-time 5 "http://127.0.0.1:$PORT/" >/dev/null; then
     echo "ERROR: Nexus is not responding on port $PORT."
-    echo "Start the application first, then retry."
+    echo "Start Nexus before installing the tunnel."
     pause
     return
   fi
-  echo "Nexus local endpoint is responding."
+  echo "Local Nexus endpoint: OK"
 
   echo
-  echo "Cloudflare login will use the browser-based authentication flow."
-  echo "Do not delete or overwrite the existing shared cert.pem."
+  echo "Existing Cloudflare certificates will not be deleted."
+  echo "The existing argo02 tunnel will not be modified."
   read -r -p "Continue with Cloudflare login? [y/N]: " answer
-  [[ "$answer" =~ ^[Yy]$ ]] || { echo "Cancelled."; pause; return; }
-
-  mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+  [[ "$answer" =~ ^[Yy]$ ]] || {
+    echo "Cancelled."
+    pause
+    return
+  }
 
   echo
-  echo "Starting Cloudflare login..."
+  echo "Starting browser-based Cloudflare login..."
   if ! "$CF" tunnel login; then
+    echo
     echo "ERROR: Cloudflare login failed."
-    echo "Do not remove cert.pem; it may be used by another tunnel."
+    echo "No tunnel will be created."
+    echo "Do not delete /root/.cloudflared/cert.pem."
+    echo "If the certificate already exists, login may be unnecessary"
+    echo "for an existing named tunnel. Verify the correct account/zone"
+    echo "before proceeding."
     pause
     return
   fi
+
+  local stamp tunnel_name tunnel_id credentials config log pidfile
+  stamp="$(date +%Y%m%d%H%M%S)"
+  tunnel_name="nexus-pro-$stamp"
 
   echo
-  echo "Creating a dedicated Nexus tunnel: $TUNNEL_NAME"
-  if ! "$CF" tunnel create "$TUNNEL_NAME"; then
+  echo "Creating dedicated tunnel: $tunnel_name"
+  if ! "$CF" tunnel create "$tunnel_name"; then
     echo "ERROR: Tunnel creation failed."
+    echo "No further setup will be attempted."
     pause
     return
   fi
 
-  TUNNEL_ID=$("$CF" tunnel list --output json 2>/dev/null |
+  # Query the exact name and obtain its UUID.
+  tunnel_id="$("$CF" tunnel list --output json 2>/dev/null |
     python3 -c '
 import json,sys
 name=sys.argv[1]
 data=json.load(sys.stdin)
-matches=[x for x in data if x.get("name")==name]
-print(matches[0]["id"] if matches else "")
-' "$TUNNEL_NAME")
+items=[x for x in data if x.get("name")==name]
+print(items[0]["id"] if len(items)==1 else "")
+' "$tunnel_name")" || true
 
-  if [[ -z "$TUNNEL_ID" ]]; then
-    echo "ERROR: Could not determine the new tunnel ID."
-    echo "Check: $CF tunnel list"
+  if [[ -z "$tunnel_id" ]]; then
+    echo "ERROR: Could not identify the new tunnel UUID."
+    echo "Check the tunnel list before retrying."
     pause
     return
   fi
 
-  CREDENTIALS="/root/.cloudflared/$TUNNEL_ID.json"
-  if [[ ! -f "$CREDENTIALS" ]]; then
-    echo "ERROR: Tunnel credentials were not found: $CREDENTIALS"
+  credentials="$CF_DIR/$tunnel_id.json"
+  if [[ ! -f "$credentials" ]]; then
+    echo "ERROR: Credentials file not found: $credentials"
+    echo "Tunnel ID: $tunnel_id"
+    echo "No running connector was started."
     pause
     return
   fi
 
-  CONFIG="$CONFIG_DIR/$TUNNEL_NAME.yml"
-  LOG="$LOG_DIR/$TUNNEL_NAME.log"
-  PIDFILE="$BASE/$TUNNEL_NAME.pid"
+  mkdir -p "$BASE/cloudflared" "$BASE/logs"
+  config="$BASE/cloudflared/$tunnel_name.yml"
+  log="$BASE/logs/$tunnel_name.log"
+  pidfile="$BASE/$tunnel_name.pid"
 
-  cat > "$CONFIG" <<EOF
-tunnel: $TUNNEL_ID
-credentials-file: $CREDENTIALS
+  cat > "$config" <<EOF
+tunnel: $tunnel_id
+credentials-file: $credentials
 
 ingress:
   - hostname: $HOSTNAME
@@ -108,71 +137,87 @@ ingress:
   - service: http_status:404
 EOF
 
-  chmod 600 "$CONFIG" "$CREDENTIALS"
+  chmod 600 "$config" "$credentials"
 
-  if ! "$CF" tunnel --config "$CONFIG" ingress validate; then
+  if ! "$CF" tunnel --config "$config" ingress validate; then
     echo "ERROR: Tunnel configuration validation failed."
     pause
     return
   fi
 
-  echo
-  echo "Tunnel created and configuration validated."
-  echo
-  echo "IMPORTANT: Add this DNS record in the Cloudflare dashboard"
-  echo "Zone: $DOMAIN"
-  echo "Type: CNAME"
-  echo "Name: nxpr"
-  echo "Target: $TUNNEL_ID.cfargotunnel.com"
-  echo "Proxy: Proxied (orange cloud)"
-  echo
-  echo "Do not run 'tunnel route dns' unless the correct zone/account"
-  echo "has been verified. Do not modify the existing argo02 tunnel."
-  read -r -p "After confirming the DNS record, press Enter to start the tunnel..."
-
-  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-    echo "This tunnel already appears to be running."
-  else
-    nohup "$CF" tunnel --no-autoupdate --config "$CONFIG" run \
-      >> "$LOG" 2>&1 < /dev/null &
-    echo "$!" > "$PIDFILE"
-    sleep 3
-  fi
-
   cat > "$BASE/state.env" <<EOF
-TUNNEL_NAME='$TUNNEL_NAME'
-TUNNEL_ID='$TUNNEL_ID'
+TUNNEL_NAME='$tunnel_name'
+TUNNEL_ID='$tunnel_id'
 DOMAIN='$DOMAIN'
 HOSTNAME='$HOSTNAME'
 PORT='$PORT'
-CONFIG='$CONFIG'
-LOG='$LOG'
-PIDFILE='$PIDFILE'
-CREDENTIALS='$CREDENTIALS'
+CONFIG='$config'
+LOG='$log'
+PIDFILE='$pidfile'
+CREDENTIALS='$credentials'
 EOF
   chmod 600 "$BASE/state.env"
 
   echo
-  echo "Tunnel launch requested."
-  echo "Local panel:"
-  curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+  echo "Tunnel created successfully."
+  echo "Tunnel name: $tunnel_name"
+  echo "Tunnel ID:   $tunnel_id"
+  echo
+  echo "Create or verify this DNS record in the Cloudflare dashboard:"
+  echo "Zone:   $DOMAIN"
+  echo "Type:   CNAME"
+  echo "Name:   nxpr"
+  echo "Target: $tunnel_id.cfargotunnel.com"
+  echo "Proxy:  Proxied (orange cloud)"
+  echo
+  echo "Do not use 'tunnel route dns' until the correct zone/account"
+  echo "has been verified."
+
+  read -r -p "Press Enter after checking the DNS record to start the tunnel..."
+
+  if [[ -f "$pidfile" ]]; then
+    oldpid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "$oldpid" =~ ^[0-9]+$ ]] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "ERROR: This tunnel appears to be running already."
+      pause
+      return
+    fi
+  fi
+
+  nohup "$CF" tunnel --no-autoupdate --config "$config" run \
+    >> "$log" 2>&1 < /dev/null &
+  local newpid=$!
+  echo "$newpid" > "$pidfile"
+  sleep 3
+
+  if ! kill -0 "$newpid" 2>/dev/null; then
+    echo "WARNING: The tunnel process may have exited."
+    echo "Check log: $log"
+    tail -n 20 "$log" 2>/dev/null || true
+    pause
+    return
+  fi
+
+  echo
+  echo "Tunnel process started."
+  echo "Local endpoint:"
+  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
     --max-time 5 "http://127.0.0.1:$PORT/" || true
   echo
-  echo "Public endpoint test:"
-  curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+  echo "Public endpoint:"
+  curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
     --max-time 15 "https://$HOSTNAME/" || true
   echo
-  echo "Tunnel log: $LOG"
-  echo "Tunnel ID: $TUNNEL_ID"
+  echo "Log: $log"
   pause
 }
 
 remove_nexus() {
   echo
-  echo "========== OPTION 2: REMOVE =========="
-  echo "This removes only the dedicated Nexus tunnel and its local files."
-  echo "Protected: argo02, webtmux, shared cert.pem, Nexus application."
-  echo "DNS records are NOT automatically deleted."
+  echo "========== REMOVE NEXUS TUNNEL =========="
+  echo "This removes only the tunnel recorded in the Nexus state file."
+  echo "It does not remove the Nexus application, DNS record, argo02,"
+  echo "webtmux, or the shared cert.pem."
   echo
   read -r -p "Type REMOVE-NEXUS to continue: " answer
   [[ "$answer" == "REMOVE-NEXUS" ]] || {
@@ -181,33 +226,54 @@ remove_nexus() {
     return
   }
 
-  if [[ -f "$BASE/state.env" ]]; then
-    # State file is generated by this script and contains shell assignments.
-    source "$BASE/state.env"
+  check_cf || { pause; return; }
 
-    if [[ -n "${PIDFILE:-}" && -f "$PIDFILE" ]]; then
-      pid=$(cat "$PIDFILE" 2>/dev/null || true)
-      if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-        echo "Stopping Nexus-specific tunnel process..."
-        kill "$pid" 2>/dev/null || true
-      fi
+  local state="$BASE/state.env"
+  local tunnel_id="" tunnel_name="" pidfile="" pid=""
+
+  if [[ -f "$state" ]]; then
+    tunnel_id="$(get_state_value TUNNEL_ID "$state" || true)"
+    tunnel_name="$(get_state_value TUNNEL_NAME "$state" || true)"
+    pidfile="$(get_state_value PIDFILE "$state" || true)"
+  fi
+
+  if [[ -n "$pidfile" && -f "$pidfile" ]]; then
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "Stopping recorded Nexus connector process..."
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+    fi
+  fi
+
+  if [[ -n "$tunnel_id" ]]; then
+    if [[ "$tunnel_id" == "31ba82dc-0a8a-4d74-be5f-2741dffdc5a3" ]]; then
+      echo "SAFETY ERROR: Refusing to delete protected argo02 tunnel."
+      pause
+      return
     fi
 
-    if [[ -n "${TUNNEL_ID:-}" ]] && check_cf; then
-      echo "Deleting dedicated tunnel $TUNNEL_ID..."
-      "$CF" tunnel delete "$TUNNEL_ID" || {
-        echo "WARNING: Cloudflare tunnel deletion failed; local files will still be removed."
-      }
+    if tunnel_exists "$tunnel_id"; then
+      echo "Deleting dedicated Nexus tunnel: $tunnel_name ($tunnel_id)"
+      if ! "$CF" tunnel delete "$tunnel_id"; then
+        echo "ERROR: Cloudflare tunnel deletion failed."
+        echo "Local state and credentials were preserved."
+        pause
+        return
+      fi
+    else
+      echo "Tunnel is not listed; skipping Cloudflare deletion."
     fi
   else
-    echo "No Nexus state file found."
+    echo "No valid Nexus state file found."
     echo "No Cloudflare tunnel will be deleted automatically."
   fi
 
   rm -rf -- "$BASE"
   echo
   echo "Nexus deployment files removed."
-  echo "Shared certificates and unrelated tunnels were preserved."
+  echo "DNS records were not deleted; remove the nxpr record manually"
+  echo "from the correct Cloudflare zone only if you no longer need it."
   pause
 }
 
@@ -232,4 +298,5 @@ done
 SCRIPT
 
 chmod 700 /root/nexus-manager.sh
-bash /root/nexus-manager.sh
+bash -n /root/nexus-manager.sh && echo "Syntax OK"
+/root/nexus-manager.sh
