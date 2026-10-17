@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -11,6 +10,9 @@ SPRITE="/.sprite/bin/sprite-env"
 NODE="/.sprite/languages/node/nvm/versions/node/v24.18.0/bin/node"
 NPM="/.sprite/languages/node/nvm/versions/node/v24.18.0/bin/npm"
 GIT="/usr/bin/git"
+
+NODE_BIN_DIR="/.sprite/languages/node/nvm/versions/node/v24.18.0/bin"
+export PATH="$NODE_BIN_DIR:/usr/local/bin:/usr/bin:/bin"
 
 BASE="/root/nexus-manager"
 PROFILES="$BASE/cloudflare-profiles"
@@ -80,6 +82,7 @@ check_tools() {
     [[ -x "$NODE" ]] || die "Node.js not found: $NODE"
     [[ -x "$NPM" ]] || die "npm not found: $NPM"
     [[ -x "$GIT" ]] || die "Git not found: $GIT"
+    command -v curl >/dev/null 2>&1 || die "curl is required but was not found."
 }
 
 # Use the known working npm binary with a clean environment.
@@ -93,7 +96,7 @@ run_npm() {
             HOME=/root \
             USER=root \
             LOGNAME=root \
-            PATH="/.sprite/languages/node/nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin" \
+            PATH="$NODE_BIN_DIR:/usr/local/bin:/usr/bin:/bin" \
             TMPDIR=/tmp \
             CI=true \
             npm_config_update_notifier=false \
@@ -123,6 +126,91 @@ profile_cli() {
         HOME="$(profile_path "$profile")" \
         TUNNEL_ORIGIN_CERT="$cert" \
         "$CLOUDFLARED" "$@"
+}
+
+# ============================================================
+# SPRITE SERVICE HEALTH AND RECOVERY
+# ============================================================
+
+service_state_json() {
+    local service_name="$1"
+    "$SPRITE" services get "$service_name" 2>/dev/null
+}
+
+ensure_service_running() {
+    local service_name="$1"
+    local state
+
+    if ! state="$(service_state_json "$service_name")"; then
+        error "Sprite service does not exist or cannot be queried: $service_name"
+        return 1
+    fi
+
+    if printf '%s' "$state" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"'; then
+        success "Service is already running: $service_name"
+        return 0
+    fi
+
+    warning "Service is not running. Attempting to start: $service_name"
+    "$SPRITE" services start "$service_name"
+
+    sleep 1
+    if state="$(service_state_json "$service_name")" && \
+       printf '%s' "$state" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"running"'; then
+        success "Service started successfully: $service_name"
+        return 0
+    fi
+
+    error "Service did not reach running state: $service_name"
+    printf '%s\n' "${state:-No service state available.}"
+    return 1
+}
+
+recover_nexus_services() {
+    local list_json
+    local service_name
+    local failed=0
+    local found=0
+
+    info "Checking registered NEXUS services. Running services will not be restarted."
+
+    if ! list_json="$("$SPRITE" services list)"; then
+        error "Could not retrieve Sprite services."
+        return 1
+    fi
+
+    while IFS= read -r service_name; do
+        [[ -n "$service_name" ]] || continue
+        found=1
+        if ! ensure_service_running "$service_name"; then
+            failed=1
+        fi
+    done < <(
+        printf '%s' "$list_json" | "$NODE" -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+                try {
+                    const services = JSON.parse(input);
+                    for (const service of services) {
+                        const name = String(service.name || "");
+                        if (/^nexus([.-]|-ui-)/i.test(name)) console.log(name);
+                    }
+                } catch {
+                    process.exitCode = 1;
+                }
+            });
+        '
+    )
+
+    if (( found == 0 )); then
+        warning "No registered NEXUS services were found."
+    elif (( failed == 0 )); then
+        success "All discovered NEXUS services are running."
+    else
+        warning "One or more NEXUS services need manual inspection."
+        return 1
+    fi
 }
 
 # ============================================================
@@ -213,13 +301,13 @@ find_tunnel_id_by_name() {
     local name="$2"
 
     printf '%s' "$json" | "$NODE" -e '
-        let s = "";
-        process.stdin.on("data", d => s += d);
+        let input = "";
+        process.stdin.on("data", chunk => input += chunk);
         process.stdin.on("end", () => {
             try {
-                const list = JSON.parse(s);
-                const t = list.find(x => x.name === process.argv[1]);
-                if (t) process.stdout.write(t.id || t.uuid || "");
+                const list = JSON.parse(input);
+                const tunnel = list.find(item => item.name === process.argv[1]);
+                if (tunnel) process.stdout.write(tunnel.id || tunnel.uuid || "");
             } catch {
                 process.exitCode = 1;
             }
@@ -231,17 +319,17 @@ print_tunnels() {
     local json="$1"
 
     printf '%s' "$json" | "$NODE" -e '
-        let s = "";
-        process.stdin.on("data", d => s += d);
+        let input = "";
+        process.stdin.on("data", chunk => input += chunk);
         process.stdin.on("end", () => {
             try {
-                const list = JSON.parse(s);
+                const list = JSON.parse(input);
                 if (!Array.isArray(list) || !list.length) {
                     console.log("No tunnels found.");
                     return;
                 }
-                for (const t of list) {
-                    console.log(`${t.name || "(unnamed)"} | ${t.id || t.uuid || "NO_UUID"}`);
+                for (const tunnel of list) {
+                    console.log(`${tunnel.name || "(unnamed)"} | ${tunnel.id || tunnel.uuid || "NO_UUID"}`);
                 }
             } catch {
                 console.error("Could not parse tunnel list.");
@@ -297,15 +385,17 @@ configure_tunnel() {
         success "Existing configuration backed up."
     fi
 
-    cat > "$config" <<EOF
-tunnel: $TUNNEL_ID
-credentials-file: $credentials
-ingress:
-  - hostname: $hostname
-    service: http://127.0.0.1:$port
-  - service: http_status:404
-EOF
+    cat > "$config" <<EOF_CONFIG
+ tunnel: $TUNNEL_ID
+ credentials-file: $credentials
+ ingress:
+   - hostname: $hostname
+     service: http://127.0.0.1:$port
+   - service: http_status:404
+EOF_CONFIG
 
+    # Remove the leading spaces before top-level YAML keys.
+    sed -i 's/^ tunnel:/tunnel:/; s/^ credentials-file:/credentials-file:/; s/^ ingress:/ingress:/' "$config"
     chmod 600 "$config"
     success "Configuration saved: $config"
 }
@@ -335,9 +425,9 @@ create_tunnel_service() {
 
     if "$SPRITE" services get "$service_name" >/dev/null 2>&1; then
         warning "Service already exists: $service_name"
-        warning "Existing service will not be overwritten."
-        "$SPRITE" services get "$service_name"
-        return 0
+        warning "Existing service configuration will not be overwritten."
+        ensure_service_running "$service_name"
+        return $?
     fi
 
     info "Creating Sprite tunnel service: $service_name"
@@ -349,7 +439,7 @@ create_tunnel_service() {
         --duration 5s \
         --no-stream
 
-    "$SPRITE" services get "$service_name"
+    ensure_service_running "$service_name"
 }
 
 configure_existing_tunnel_flow() {
@@ -379,8 +469,7 @@ create_new_tunnel_flow() {
     valid_name "$new_name" || die "Invalid tunnel name."
 
     json="$(tunnels_json)" || die "Unable to retrieve tunnel list."
-    [[ -z "$(find_tunnel_id_by_name "$json" "$new_name")" ]] ||
-        die "Tunnel already exists. Use option 3."
+    [[ -z "$(find_tunnel_id_by_name "$json" "$new_name")" ]] || die "Tunnel already exists. Use option 3."
 
     warning "A new remote Cloudflare tunnel will be created."
     read -r -p "Type CREATE to confirm: " answer
@@ -496,8 +585,7 @@ find_app_directory() {
         fi
     done
 
-    find "$root" -maxdepth 4 -type f -name package.json -print -quit |
-        sed 's#/package.json$##'
+    find "$root" -maxdepth 4 -type f -name package.json -print -quit | sed 's#/package.json$##'
 }
 
 install_nexus_panel() {
@@ -520,8 +608,7 @@ install_nexus_panel() {
     if [[ -e "$INSTALL_DIR" ]]; then
         warning "Installation directory already exists: $INSTALL_DIR"
         read -r -p "Use the existing directory without deleting it? [y/N]: " answer
-        [[ "$answer" =~ ^[Yy]$ ]] ||
-            die "Choose another installation name or inspect the directory manually."
+        [[ "$answer" =~ ^[Yy]$ ]] || die "Choose another installation name or inspect the directory manually."
     else
         mkdir -p "$INSTALL_DIR"
     fi
@@ -530,12 +617,9 @@ install_nexus_panel() {
     PANEL_PORT="${PANEL_PORT:-9129}"
     valid_port "$PANEL_PORT" || die "Invalid panel port."
 
-    # Reuse an existing valid source tree, even if .git is absent.
-    # Never delete a non-Git directory or the data directory automatically.
     if [[ -d "$repository_dir/.git" ]]; then
         warning "Git checkout already exists."
         read -r -p "Pull latest changes from GitHub? [y/N]: " answer
-
         if [[ "$answer" =~ ^[Yy]$ ]]; then
             "$GIT" -C "$repository_dir" pull --ff-only
         fi
@@ -554,8 +638,7 @@ install_nexus_panel() {
     success "Source directory is available."
 
     APP_DIR="$(find_app_directory "$repository_dir")"
-    [[ -n "$APP_DIR" && -f "$APP_DIR/package.json" ]] ||
-        die "Could not locate package.json in the repository."
+    [[ -n "$APP_DIR" && -f "$APP_DIR/package.json" ]] || die "Could not locate package.json in the repository."
 
     package_file="$APP_DIR/package.json"
     entrypoint="$APP_DIR/index.js"
@@ -568,7 +651,6 @@ install_nexus_panel() {
 
     printf '\n'
     success "Application source: $APP_DIR"
-
     info "Checking Node.js and npm with a clean environment..."
     "$NODE" -v
     run_npm "$APP_DIR" -v
@@ -577,25 +659,20 @@ install_nexus_panel() {
     chmod 700 "$INSTALL_DIR" "$data_dir"
 
     info "Installing Node.js dependencies..."
-
     if [[ -f "$APP_DIR/package-lock.json" ]]; then
         run_npm "$APP_DIR" ci --no-audit --no-fund
     else
         run_npm "$APP_DIR" install --no-audit --no-fund
     fi
-
     success "Dependency installation completed."
 
     start_script="$("$NODE" -e '
         const fs = require("fs");
-        const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        if (p.scripts && p.scripts.start) process.stdout.write(p.scripts.start);
+        const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+        if (pkg.scripts && pkg.scripts.start) process.stdout.write(pkg.scripts.start);
     ' "$package_file")"
 
-    if [[ -z "$start_script" ]]; then
-        die "No start script found in package.json."
-    fi
-
+    [[ -n "$start_script" ]] || die "No start script found in package.json."
     info "Detected start script: $start_script"
     info "Direct entrypoint selected: $entrypoint"
 
@@ -615,8 +692,6 @@ install_nexus_panel() {
         return 0
     }
 
-    # Sprite expects one comma-separated --env argument.
-    # Use the actual detected application directory and entrypoint.
     "$SPRITE" services create "$service_name" \
         --cmd "$NODE" \
         --args "$entrypoint" \
@@ -627,12 +702,10 @@ install_nexus_panel() {
 
     printf '\n'
     "$SPRITE" services get "$service_name"
+    ensure_service_running "$service_name" || return 1
 
-    printf '\n'
     info "Checking local HTTP response..."
-    if curl -sS --max-time 5 -o /dev/null \
-        -w 'HTTP status: %{http_code}\n' \
-        "http://127.0.0.1:$PANEL_PORT/"; then
+    if curl -sS --max-time 5 -o /dev/null -w 'HTTP status: %{http_code}\n' "http://127.0.0.1:$PANEL_PORT/"; then
         success "HTTP endpoint responded."
     else
         warning "No HTTP response yet. Check the service state and logs."
@@ -659,9 +732,7 @@ check_nexus_panel() {
     valid_port "$port" || die "Invalid port."
 
     info "Testing local HTTP endpoint on port $port..."
-
-    if status="$(curl -sS -o /dev/null -w '%{http_code}' \
-        --max-time 8 "http://127.0.0.1:$port/")"; then
+    if status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 "http://127.0.0.1:$port/")"; then
         success "HTTP status: $status"
     else
         error "Local HTTP check failed."
@@ -682,10 +753,8 @@ list_nexus_installations() {
         printf '\n'
         printf "${GREEN}Name:${RESET} %s\n" "$(basename "$dir")"
         printf "Path: %s\n" "$dir"
-        [[ -d "$dir/repository" ]] && echo "Repository: present" ||
-            echo "Repository: not found"
-        [[ -d "$dir/data" ]] && echo "Data directory: present" ||
-            echo "Data directory: not found"
+        [[ -d "$dir/repository" ]] && echo "Repository: present" || echo "Repository: not found"
+        [[ -d "$dir/data" ]] && echo "Data directory: present" || echo "Data directory: not found"
     done
 
     (( found == 1 )) || warning "No NEXUS installation directories found."
@@ -715,13 +784,12 @@ main() {
         printf "${MAGENTA}10)${RESET} Install NEXUS panel from GitHub\n"
         printf "${MAGENTA}11)${RESET} Check NEXUS panel\n"
         printf "${MAGENTA}12)${RESET} List NEXUS installations\n"
+        printf "${GREEN}13)${RESET} Start stopped NEXUS services\n"
         printf "${RED}0)${RESET}  Exit\n"
         printf "${CYAN}----------------------------------------------${RESET}\n"
 
         read -r -p "Select: " choice || exit 0
 
-        # Guard each action so an error returns to the menu instead
-        # of terminating the manager under set -e.
         case "$choice" in
             1)  list_services || warning "Could not list services."; pause ;;
             2)  list_tunnels || warning "Could not list tunnels."; pause ;;
@@ -735,6 +803,7 @@ main() {
             10) install_nexus_panel || warning "Panel installation did not complete."; pause ;;
             11) check_nexus_panel || warning "Panel check failed."; pause ;;
             12) list_nexus_installations || warning "Could not list installations."; pause ;;
+            13) recover_nexus_services || warning "One or more NEXUS services could not be started."; pause ;;
             0)  exit 0 ;;
             *)  warning "Invalid option."; sleep 1 ;;
         esac
